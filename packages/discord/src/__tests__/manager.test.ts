@@ -1223,6 +1223,81 @@ describe("DiscordManager handleMessage pipeline", () => {
     expect(options.resume).toBeNull();
   });
 
+  // ---- message author attribution (vulpes-pack#354) ----
+
+  it("includes the message author in the prompt sent to trigger() for a resumed session", async () => {
+    const triggerCalls: unknown[][] = [];
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      triggerCalls.push(args);
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    // A resumed session skips the `[Name at <ts>]:` context block (it's only
+    // built when there is no existing session) — the author must still reach
+    // the prompt, or the connector-side agent can't tell who is speaking.
+    connector.sessionManager.getSession = vi
+      .fn()
+      .mockResolvedValue({ sessionId: "existing-session-1" });
+
+    await manager.start();
+    const { event } = createMessageEvent();
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(triggerCalls).toHaveLength(1);
+    const options = triggerCalls[0][2] as { prompt: string };
+    expect(options.prompt).toBe("Current user message from TestUser (<@user1>): Hello bot!");
+  });
+
+  it("includes the author exactly once in a fresh session with prior channel context", async () => {
+    const triggerCalls: unknown[][] = [];
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      triggerCalls.push(args);
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    // buildManagerWithTrigger's connector defaults getSession() to null, so
+    // this is a fresh conversation — the `[Name at <ts>]:` context block IS
+    // built here. The current message's author line must still appear only
+    // once, at the end (not duplicated by the context block).
+    const { event } = createMessageEvent();
+    event.context.messages = [
+      {
+        authorId: "user2",
+        authorName: "OtherUser",
+        isBot: false,
+        isSelf: false,
+        content: "earlier message",
+        timestamp: "2024-01-01T00:00:00.000Z",
+        messageId: "m1",
+      },
+    ];
+
+    await manager.start();
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(triggerCalls).toHaveLength(1);
+    const options = triggerCalls[0][2] as { prompt: string };
+    const authorLine = "Current user message from TestUser (<@user1>): Hello bot!";
+    expect(options.prompt.endsWith(authorLine)).toBe(true);
+    expect(options.prompt.split(authorLine)).toHaveLength(2); // appears exactly once
+  });
+
   // ---- answers mode: suppresses reasoning turns, sends answer turns ----
 
   it("suppresses reasoning turns (text + tool_use) in 'answers' mode", async () => {
