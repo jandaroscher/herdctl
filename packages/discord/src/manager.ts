@@ -567,7 +567,8 @@ export class DiscordManager implements IChatManager {
 
     try {
       // Handle voice messages: transcribe audio before triggering the agent
-      let prompt = `Current user message from ${event.metadata.username} (<@${event.metadata.userId}>): ${event.prompt}`;
+      const authorPrefix = `Current user message from ${event.metadata.username} (<@${event.metadata.userId}>): `;
+      let prompt = `${authorPrefix}${event.prompt}`;
       if (!existingSessionId && event.context.messages.length > 0) {
         const priorContext = formatContextForPrompt(event.context);
         if (priorContext) {
@@ -623,7 +624,7 @@ export class DiscordManager implements IChatManager {
             language: voiceConfig.language,
           });
 
-          prompt = `[Voice message transcription]: ${transcription.text}`;
+          prompt = `${authorPrefix}[Voice message transcription]: ${transcription.text}`;
           logger.info(`Voice message transcribed: "${prompt.substring(0, 80)}..."`);
 
           // Echo the transcription to the channel so everyone can read the voice message
@@ -680,7 +681,7 @@ export class DiscordManager implements IChatManager {
             "",
             "---",
             "",
-            `User message: ${prompt}`,
+            prompt,
           ].join("\n");
           prompt = attachmentBlock;
         }
