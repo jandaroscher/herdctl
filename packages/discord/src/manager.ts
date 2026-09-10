@@ -567,7 +567,7 @@ export class DiscordManager implements IChatManager {
 
     try {
       // Handle voice messages: transcribe audio before triggering the agent
-      let prompt = event.prompt;
+      let prompt = `Current user message from ${event.metadata.username} (<@${event.metadata.userId}>): ${event.prompt}`;
       if (!existingSessionId && event.context.messages.length > 0) {
         const priorContext = formatContextForPrompt(event.context);
         if (priorContext) {
@@ -575,7 +575,7 @@ export class DiscordManager implements IChatManager {
             "Recent conversation context from this Discord channel:",
             priorContext,
             "",
-            `Current user message: ${prompt}`,
+            prompt,
           ].join("\n");
         }
       }

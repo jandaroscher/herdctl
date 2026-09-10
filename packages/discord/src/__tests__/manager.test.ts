@@ -1223,6 +1223,39 @@ describe("DiscordManager handleMessage pipeline", () => {
     expect(options.resume).toBeNull();
   });
 
+  // ---- message author attribution (vulpes-pack#354) ----
+
+  it("includes the message author in the prompt sent to trigger() for a resumed session", async () => {
+    const triggerCalls: unknown[][] = [];
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      triggerCalls.push(args);
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    // A resumed session skips the `[Name at <ts>]:` context block (it's only
+    // built when there is no existing session) — the author must still reach
+    // the prompt, or the connector-side agent can't tell who is speaking.
+    connector.sessionManager.getSession = vi
+      .fn()
+      .mockResolvedValue({ sessionId: "existing-session-1" });
+
+    await manager.start();
+    const { event } = createMessageEvent();
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(triggerCalls).toHaveLength(1);
+    const options = triggerCalls[0][2] as { prompt: string };
+    expect(options.prompt).toBe("Current user message from TestUser (<@user1>): Hello bot!");
+  });
+
   // ---- answers mode: suppresses reasoning turns, sends answer turns ----
 
   it("suppresses reasoning turns (text + tool_use) in 'answers' mode", async () => {
