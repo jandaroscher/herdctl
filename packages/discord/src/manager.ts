@@ -575,7 +575,7 @@ export class DiscordManager implements IChatManager {
             "Recent conversation context from this Discord channel:",
             priorContext,
             "",
-            `Current user message: ${prompt}`,
+            `Current user message (from ${event.metadata.username}): ${prompt}`,
           ].join("\n");
         }
       }
