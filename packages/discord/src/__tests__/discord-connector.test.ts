@@ -1,6 +1,7 @@
 import type { EventEmitter } from "node:events";
 import type { IChatSessionManager } from "@herdctl/chat";
 import type { AgentChatDiscord, AgentConfig, FleetManager } from "@herdctl/core";
+import type { Message } from "discord.js";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // =============================================================================
@@ -1222,6 +1223,66 @@ describe("DiscordConnector", () => {
       });
 
       expect(connector.agentName).toBe("test-agent");
+    });
+  });
+
+  // =============================================================================
+  // Reply-reference fetch failure (vulpes-pack#629)
+  // =============================================================================
+
+  describe("message handling — reply reference", () => {
+    it("still emits the message event with repliedTo undefined when the referenced-message fetch fails", async () => {
+      const connector = new DiscordConnector({
+        agentConfig,
+        discordConfig,
+        botToken: "valid-token",
+        fleetManager,
+        sessionManager,
+        logger: mockLogger,
+      });
+
+      // Set the bot user directly rather than running a full connect()/ready
+      // cycle — _handleMessage only needs `_botUser.id` to be populated.
+      // @ts-expect-error - private field, exercised directly for this test
+      connector._botUser = { id: "bot-1", username: "TestBot", discriminator: "0001" };
+
+      const fetchMock = vi.fn((arg: unknown) => {
+        if (typeof arg === "string") {
+          // The reply-reference fetch (channel.messages.fetch(messageId))
+          return Promise.reject(new Error("Unknown Message"));
+        }
+        // The history fetch (channel.messages.fetch({ before, limit }))
+        return Promise.resolve(new Map());
+      });
+
+      const channel = {
+        id: "channel-456",
+        messages: { fetch: fetchMock },
+      };
+
+      const message = {
+        id: "msg-current",
+        guildId: "guild-123",
+        author: { id: "user-1", username: "TestUser", bot: false },
+        content: "ja, lege ticket an",
+        channel,
+        mentions: { users: new Map([["bot-1", {}]]), roles: new Map() },
+        reference: { messageId: "msg-earlier" },
+        flags: undefined,
+        attachments: new Map(),
+        reactions: { cache: new Map() },
+      } as unknown as Message;
+
+      const messageEvents: Array<{ metadata: { repliedTo?: unknown } }> = [];
+      connector.on("message", (payload) => messageEvents.push(payload));
+
+      // @ts-expect-error - private method, exercised directly (the discord.js
+      // mock above doesn't wire up a real messageCreate event)
+      await connector._handleMessage(message);
+
+      expect(fetchMock).toHaveBeenCalledWith("msg-earlier");
+      expect(messageEvents).toHaveLength(1);
+      expect(messageEvents[0].metadata.repliedTo).toBeUndefined();
     });
   });
 });

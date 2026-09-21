@@ -1298,6 +1298,195 @@ describe("DiscordManager handleMessage pipeline", () => {
     expect(options.prompt.split(authorLine)).toHaveLength(2); // appears exactly once
   });
 
+  // ---- resumed-session context since last turn (vulpes-pack#629) ----
+
+  it("includes channel messages posted after the resumed session's lastMessageAt", async () => {
+    const triggerCalls: unknown[][] = [];
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      triggerCalls.push(args);
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    connector.sessionManager.getSession = vi.fn().mockResolvedValue({
+      sessionId: "existing-session-1",
+      lastMessageAt: "2024-01-01T00:05:00.000Z",
+    });
+
+    await manager.start();
+    const { event } = createMessageEvent();
+    event.context.messages = [
+      {
+        authorId: "user2",
+        authorName: "OtherUser",
+        isBot: false,
+        isSelf: false,
+        content: "too old, before lastMessageAt",
+        timestamp: "2024-01-01T00:00:00.000Z",
+        messageId: "m-old",
+      },
+      {
+        authorId: "bot1",
+        authorName: "TestBot",
+        isBot: true,
+        isSelf: true,
+        content: "schedule job proposal posted between turns",
+        timestamp: "2024-01-01T00:10:00.000Z",
+        messageId: "m-new",
+      },
+    ];
+
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(triggerCalls).toHaveLength(1);
+    const options = triggerCalls[0][2] as { prompt: string };
+    expect(options.prompt).toContain("Messages posted in this channel since your last turn:");
+    expect(options.prompt).toContain("schedule job proposal posted between turns");
+    expect(options.prompt).not.toContain("too old, before lastMessageAt");
+  });
+
+  it("omits the since-last-turn block when nothing was posted after lastMessageAt", async () => {
+    const triggerCalls: unknown[][] = [];
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      triggerCalls.push(args);
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    connector.sessionManager.getSession = vi.fn().mockResolvedValue({
+      sessionId: "existing-session-1",
+      lastMessageAt: "2024-01-01T00:05:00.000Z",
+    });
+
+    await manager.start();
+    const { event } = createMessageEvent();
+    event.context.messages = [
+      {
+        authorId: "user2",
+        authorName: "OtherUser",
+        isBot: false,
+        isSelf: false,
+        content: "too old, before lastMessageAt",
+        timestamp: "2024-01-01T00:00:00.000Z",
+        messageId: "m-old",
+      },
+    ];
+
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(triggerCalls).toHaveLength(1);
+    const options = triggerCalls[0][2] as { prompt: string };
+    expect(options.prompt).not.toContain("Messages posted in this channel since your last turn:");
+    expect(options.prompt).toBe("Current user message from TestUser (<@user1>): Hello bot!");
+  });
+
+  it("keeps a bot/schedule post from allMessages in the since-block even when messages capped it out", async () => {
+    const triggerCalls: unknown[][] = [];
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      triggerCalls.push(args);
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    connector.sessionManager.getSession = vi.fn().mockResolvedValue({
+      sessionId: "existing-session-1",
+      lastMessageAt: "2024-01-01T00:05:00.000Z",
+    });
+
+    await manager.start();
+    const { event } = createMessageEvent();
+
+    const botPost = {
+      authorId: "bot1",
+      authorName: "TestBot",
+      isBot: true,
+      isSelf: true,
+      content: "schedule job proposal, capped out of the prioritized window",
+      timestamp: "2024-01-01T00:06:00.000Z",
+      messageId: "m-bot",
+    };
+    const humanMessages = Array.from({ length: 12 }, (_, i) => ({
+      authorId: "user2",
+      authorName: "OtherUser",
+      isBot: false,
+      isSelf: false,
+      content: `human message ${i + 1}`,
+      timestamp: `2024-01-01T00:${String(7 + i).padStart(2, "0")}:00.000Z`,
+      messageId: `m-human-${i + 1}`,
+    }));
+
+    // Simulates buildConversationContext's prioritizeUserMessages cap: with 12
+    // human messages > maxMessages (10), the older bot post never makes it
+    // into `messages` even though it's newer than lastMessageAt.
+    event.context.messages = humanMessages.slice(0, 10);
+    // `allMessages` is the full fetched+filtered window (fetchLimit=20), which
+    // still has the bot post — this is what the since-filter must read.
+    event.context.allMessages = [botPost, ...humanMessages];
+
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(triggerCalls).toHaveLength(1);
+    const options = triggerCalls[0][2] as { prompt: string };
+    expect(options.prompt).toContain("Messages posted in this channel since your last turn:");
+    expect(options.prompt).toContain("schedule job proposal, capped out of the prioritized window");
+  });
+
+  // ---- reply reference (vulpes-pack#629) ----
+
+  it("includes a 'Replying to' line above the current user message when the trigger is a Discord reply", async () => {
+    const triggerCalls: unknown[][] = [];
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      triggerCalls.push(args);
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    await manager.start();
+    const { event } = createMessageEvent();
+    event.metadata.repliedTo = {
+      authorName: "SupportBot",
+      timestamp: "2024-01-01T00:05:00.000Z",
+      content: "Neue Support-Mail eingegangen. Soll ich dafür ein Ticket anlegen?",
+    };
+
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(triggerCalls).toHaveLength(1);
+    const options = triggerCalls[0][2] as { prompt: string };
+    const replyLine =
+      "Replying to [SupportBot at 2024-01-01T00:05:00.000Z]: Neue Support-Mail eingegangen. Soll ich dafür ein Ticket anlegen?";
+    const authorLine = "Current user message from TestUser (<@user1>): Hello bot!";
+    expect(options.prompt).toBe(`${replyLine}\n${authorLine}`);
+  });
+
   // ---- answers mode: suppresses reasoning turns, sends answer turns ----
 
   it("suppresses reasoning turns (text + tool_use) in 'answers' mode", async () => {

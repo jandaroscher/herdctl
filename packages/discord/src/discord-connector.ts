@@ -793,6 +793,23 @@ export class DiscordConnector extends EventEmitter implements IDiscordConnector 
       }
     }
 
+    // Resolve the message this one replies to, if any (best-effort, non-fatal)
+    let repliedTo: DiscordConnectorEventMap["message"]["metadata"]["repliedTo"];
+    if (message.reference?.messageId) {
+      try {
+        const refMessage = await channel.messages.fetch(message.reference.messageId);
+        repliedTo = {
+          authorName: refMessage.author.username,
+          timestamp: refMessage.createdAt.toISOString(),
+          content: refMessage.content.slice(0, 1500),
+        };
+      } catch (err) {
+        this._logger.debug("Failed to fetch replied-to message", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     // Create reaction functions for acknowledgement emoji support
     const addReaction = async (emoji: string): Promise<void> => {
       try {
@@ -835,6 +852,7 @@ export class DiscordConnector extends EventEmitter implements IDiscordConnector 
         voiceAttachmentUrl,
         voiceAttachmentName,
         attachments,
+        repliedTo,
       },
       reply,
       replyWithRef,
