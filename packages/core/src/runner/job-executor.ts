@@ -1067,6 +1067,11 @@ export class JobExecutor {
           if (retriedAfterEmptyResume) {
             lastError = emptyResumeRetryFailedError();
           } else if (retriedSameSessionAfterEmptyResume) {
+            // `resumeSessionId` is only undefined here if some other retry
+            // path (e.g. session-not-found/expired, above) already switched
+            // this run to a fresh session in between — that fresh run
+            // producing zero turns is the same pre-existing, not-this-bug
+            // case as the final `else` below, so fall through without acting.
             if (resumeSessionId) {
               this.logger.warn(
                 `Job ${job.id}: resumed session ${resumeSessionId} for ${agent.name} produced zero assistant turns again on the same session. Clearing session and retrying once with a fresh session.`,
@@ -1125,8 +1130,11 @@ export class JobExecutor {
             await executeWithRetry(resumeSessionId);
             return;
           }
-          // else: a genuinely fresh (non-resume) run with zero turns — not
-          // this ticket's failure mode, leave the existing behavior alone.
+          // else: a genuinely fresh (non-resume) run with zero turns — either
+          // the original run had no `resumeSessionId` at all, or an earlier
+          // retry path switched it to a fresh session already (see the
+          // fall-through comment above) — not this ticket's failure mode,
+          // leave the existing behavior alone.
         }
       } catch (error) {
         // Check if this is a session expiration error from the SDK

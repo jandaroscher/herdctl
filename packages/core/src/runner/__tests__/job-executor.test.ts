@@ -3651,6 +3651,11 @@ describe("empty-resume retry (vulpes-pack#206)", () => {
     expect(resumes).toEqual(["zombie-session-id", "zombie-session-id", undefined]);
     expect(result.success).toBe(true);
     expect(result.summary).toBe("Actually did the work");
+
+    // The fresh-session fallback DOES clear the stale pointer, unlike the
+    // same-session retry above.
+    const sessionInfo = await getSessionInfo(sessionsDir, "double-zombie-agent");
+    expect(sessionInfo).toBeNull();
   });
 
   it("fails loudly (not success) when the fresh-session retry also produces zero assistant turns", async () => {
