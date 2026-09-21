@@ -1,6 +1,6 @@
 {
   "name": "@herdctl/core",
-  "version": "5.33.0-vulpes.5",
+  "version": "5.33.0-vulpes.6",
   "description": "Core library for herdctl fleet management",
   "license": "MIT",
   "type": "module",
