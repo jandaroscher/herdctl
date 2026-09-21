@@ -458,6 +458,9 @@ export class JobExecutor {
     // Track whether we've already retried a resume that produced zero
     // assistant turns (see `assistantMessageCount` below, vulpes-pack#206).
     let retriedAfterEmptyResume = false;
+    // Track whether we've already retried an empty resume on the SAME
+    // session id before falling back to a fresh one (vulpes-pack#626).
+    let retriedSameSessionAfterEmptyResume = false;
 
     const executeWithRetry = async (resumeSessionId: string | undefined): Promise<void> => {
       // Session-backed runs hold the handle here so the retry paths and the
@@ -606,7 +609,7 @@ export class JobExecutor {
       const emptyResumeRetryFailedError = (): SDKStreamingError =>
         new SDKStreamingError(
           buildErrorMessage(
-            "Resumed session produced zero assistant turns, and so did the retry with a fresh session",
+            "Resumed session produced zero assistant turns, and so did the same-session retry and the fresh-session retry",
             { jobId: job.id, agentName: agent.name },
           ),
           {
@@ -1040,12 +1043,18 @@ export class JobExecutor {
         // (`resumeSessionId` set) — a fresh, non-resumed run producing no
         // turns is a different, pre-existing situation, not this bug.
         //
-        // Single retry: the first time this happens, discard the (likely
-        // zombie) session pointer and retry once with a fresh session. If
-        // that retry (running with `resumeSessionId` undefined, so it can't
-        // re-enter this branch on `resumeSessionId` — `retriedAfterEmptyResume`
-        // is what catches it) is ALSO empty, this is a real failure, not a
-        // zombie resume — fail loudly (a real error, not cancelled/timeout)
+        // Retries: the empty result is usually a stale `task_notification`
+        // replay (a resume whose transcript ends with a prior run's live
+        // background-task notice), not a zombie session — a second resume of
+        // the SAME session answers with full context. So retry the same
+        // session once first, WITHOUT clearing the pointer (preserves any
+        // Discord/channel context tied to it). Only if that retry is ALSO
+        // empty do we fall back to the original behavior: discard the
+        // (likely genuinely zombie) session pointer and retry once with a
+        // fresh session. If THAT retry (running with `resumeSessionId`
+        // undefined, so it can't re-enter this branch on `resumeSessionId` —
+        // `retriedAfterEmptyResume` is what catches it) is also empty, this is
+        // a real failure — fail loudly (a real error, not cancelled/timeout)
         // rather than keep reporting success on nothing.
         if (
           sawTerminalMessage &&
@@ -1057,36 +1066,63 @@ export class JobExecutor {
         ) {
           if (retriedAfterEmptyResume) {
             lastError = emptyResumeRetryFailedError();
+          } else if (retriedSameSessionAfterEmptyResume) {
+            if (resumeSessionId) {
+              this.logger.warn(
+                `Job ${job.id}: resumed session ${resumeSessionId} for ${agent.name} produced zero assistant turns again on the same session. Clearing session and retrying once with a fresh session.`,
+              );
+
+              try {
+                const sessionsDir = join(stateDir, "sessions");
+                await clearSession(sessionsDir, sessionKey);
+                this.logger.info?.(`Cleared zombie session for ${agent.qualifiedName}`);
+              } catch (clearError) {
+                this.logger.warn(
+                  `Failed to clear zombie session: ${(clearError as Error).message}`,
+                );
+              }
+
+              try {
+                await appendJobOutput(jobsDir, job.id, {
+                  type: "system",
+                  content:
+                    "Resumed session produced no assistant turns again. Retrying with fresh session.",
+                });
+              } catch {
+                // Ignore output write failures
+              }
+
+              retriedAfterEmptyResume = true;
+              messagesReceived = 0;
+              endedWithLiveBackgroundTasks = false;
+              // Tear the zombie session down before the retry opens a new
+              // one, so two `claude` processes never run for this job at once.
+              await closeSession();
+              await executeWithRetry(undefined);
+              return;
+            }
           } else if (resumeSessionId) {
             this.logger.warn(
-              `Job ${job.id}: resumed session ${resumeSessionId} for ${agent.name} produced zero assistant turns (likely a hard-closed/zombie session). Clearing session and retrying once with a fresh session.`,
+              `Job ${job.id}: resumed session ${resumeSessionId} for ${agent.name} produced zero assistant turns (stale task_notification replay likely). Retrying once on the same session.`,
             );
-
-            try {
-              const sessionsDir = join(stateDir, "sessions");
-              await clearSession(sessionsDir, sessionKey);
-              this.logger.info?.(`Cleared zombie session for ${agent.qualifiedName}`);
-            } catch (clearError) {
-              this.logger.warn(`Failed to clear zombie session: ${(clearError as Error).message}`);
-            }
 
             try {
               await appendJobOutput(jobsDir, job.id, {
                 type: "system",
                 content:
-                  "Resumed session produced no assistant turns. Retrying with fresh session.",
+                  "Resumed session produced no assistant turns. Retrying once on the same session.",
               });
             } catch {
               // Ignore output write failures
             }
 
-            retriedAfterEmptyResume = true;
+            retriedSameSessionAfterEmptyResume = true;
             messagesReceived = 0;
             endedWithLiveBackgroundTasks = false;
-            // Tear the zombie session down before the retry opens a new one,
-            // so two `claude` processes never run for this job at once.
+            // Tear the session down before the retry re-opens it, so two
+            // `claude` processes never run for this job at once.
             await closeSession();
-            await executeWithRetry(undefined);
+            await executeWithRetry(resumeSessionId);
             return;
           }
           // else: a genuinely fresh (non-resume) run with zero turns — not

@@ -3556,9 +3556,66 @@ describe("empty-resume retry (vulpes-pack#206)", () => {
     await rm(tempDir, { recursive: true, force: true });
   });
 
-  it("retries once when a resumed session emits an immediate empty terminal result", async () => {
+  it("retries once on the SAME session when a resume emits an immediate empty terminal result", async () => {
     const sessionsDir = join(stateDir, "sessions");
     await updateSessionInfo(sessionsDir, "zombie-agent", {
+      session_id: "zombie-session-id",
+      mode: "autonomous",
+    });
+
+    const resumes: Array<string | undefined> = [];
+    let resumeCallCount = 0;
+    const runtime = createMockRuntime(async function* (options: { resume?: string }) {
+      resumes.push(options.resume);
+      if (options.resume) {
+        resumeCallCount++;
+        if (resumeCallCount === 1) {
+          // The first resume: a stale task_notification replayed straight
+          // into an empty terminal — zero assistant messages, zero turns,
+          // no error at all.
+          yield {
+            type: "system",
+            subtype: "task_notification",
+            task_id: "t1",
+          } as unknown as SDKMessage;
+          yield { type: "result", subtype: "success", result: "" } as SDKMessage;
+          return;
+        }
+        // The second resume of the SAME session: the notification has
+        // already been replayed, so this turn answers the actual prompt.
+        yield { type: "assistant", content: "Actually did the work" };
+        yield {
+          type: "result",
+          subtype: "success",
+          result: "Actually did the work",
+          num_turns: 1,
+        } as SDKMessage;
+        return;
+      }
+      throw new Error("should not fall back to a fresh session in this test");
+    });
+
+    const executor = new JobExecutor(runtime, { logger: createMockLogger() });
+    const result = await executor.execute({
+      agent: createTestAgent({ name: "zombie-agent" }),
+      prompt: "carry on",
+      stateDir,
+      resume: "zombie-session-id",
+    });
+
+    expect(resumes).toEqual(["zombie-session-id", "zombie-session-id"]);
+    expect(result.success).toBe(true);
+    expect(result.summary).toBe("Actually did the work");
+
+    // The session pointer must survive a same-session retry — clearing it
+    // would destroy any Discord/channel context tied to that session.
+    const sessionInfo = await getSessionInfo(sessionsDir, "zombie-agent");
+    expect(sessionInfo?.session_id).toBe("zombie-session-id");
+  });
+
+  it("falls back to a fresh session when the same-session retry is also empty", async () => {
+    const sessionsDir = join(stateDir, "sessions");
+    await updateSessionInfo(sessionsDir, "double-zombie-agent", {
       session_id: "zombie-session-id",
       mode: "autonomous",
     });
@@ -3567,17 +3624,11 @@ describe("empty-resume retry (vulpes-pack#206)", () => {
     const runtime = createMockRuntime(async function* (options: { resume?: string }) {
       resumes.push(options.resume);
       if (options.resume) {
-        // The zombie resume: a stale task_notification replayed straight
-        // into an empty terminal — zero assistant messages, zero turns, no
-        // error at all.
-        yield {
-          type: "system",
-          subtype: "task_notification",
-          task_id: "t1",
-        } as unknown as SDKMessage;
+        // Empty on both resume attempts (same session, twice) — a genuine
+        // zombie, not a stale-notification replay.
         yield { type: "result", subtype: "success", result: "" } as SDKMessage;
       } else {
-        // The retry, on a fresh session: a real turn.
+        // The fresh-session fallback: a real turn.
         yield { type: "assistant", content: "Actually did the work" };
         yield {
           type: "result",
@@ -3590,20 +3641,21 @@ describe("empty-resume retry (vulpes-pack#206)", () => {
 
     const executor = new JobExecutor(runtime, { logger: createMockLogger() });
     const result = await executor.execute({
-      agent: createTestAgent({ name: "zombie-agent" }),
+      agent: createTestAgent({ name: "double-zombie-agent" }),
       prompt: "carry on",
       stateDir,
       resume: "zombie-session-id",
     });
 
-    expect(resumes).toEqual(["zombie-session-id", undefined]);
+    // Same session retried once, then falls back to a fresh session.
+    expect(resumes).toEqual(["zombie-session-id", "zombie-session-id", undefined]);
     expect(result.success).toBe(true);
     expect(result.summary).toBe("Actually did the work");
   });
 
-  it("fails loudly (not success) when the retry also produces zero assistant turns", async () => {
+  it("fails loudly (not success) when the fresh-session retry also produces zero assistant turns", async () => {
     const sessionsDir = join(stateDir, "sessions");
-    await updateSessionInfo(sessionsDir, "double-zombie-agent", {
+    await updateSessionInfo(sessionsDir, "triple-zombie-agent", {
       session_id: "zombie-session-id",
       mode: "autonomous",
     });
@@ -3611,20 +3663,21 @@ describe("empty-resume retry (vulpes-pack#206)", () => {
     const resumes: Array<string | undefined> = [];
     const runtime = createMockRuntime(async function* (options: { resume?: string }) {
       resumes.push(options.resume);
-      // Empty every time — the fresh retry is just as much a dead end.
+      // Empty every time — same session twice, then the fresh retry is
+      // just as much a dead end.
       yield { type: "result", subtype: "success", result: "" } as SDKMessage;
     });
 
     const executor = new JobExecutor(runtime, { logger: createMockLogger() });
     const result = await executor.execute({
-      agent: createTestAgent({ name: "double-zombie-agent" }),
+      agent: createTestAgent({ name: "triple-zombie-agent" }),
       prompt: "carry on",
       stateDir,
       resume: "zombie-session-id",
     });
 
-    // Exactly one retry: resumed once, then fresh once, then gives up.
-    expect(resumes).toEqual(["zombie-session-id", undefined]);
+    // Three empty attempts: same session, same session again, then fresh.
+    expect(resumes).toEqual(["zombie-session-id", "zombie-session-id", undefined]);
     expect(result.success).toBe(false);
     expect(result.error?.message).toContain("zero assistant turns");
 
