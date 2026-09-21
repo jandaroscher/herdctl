@@ -411,6 +411,12 @@ export interface DiscordConnectorEventMap {
       voiceAttachmentName?: string;
       /** Non-voice file attachments (images, PDFs, text files) */
       attachments?: DiscordAttachmentInfo[];
+      /** The message this one is a Discord reply to, if any (fetch best-effort) */
+      repliedTo?: {
+        authorName: string;
+        timestamp: string;
+        content: string;
+      };
     };
     /** Function to send a reply in the same channel (text or embed) */
     reply: (content: string | DiscordReplyPayload) => Promise<void>;

@@ -464,11 +464,13 @@ export class DiscordManager implements IChatManager {
     // Get existing session for this channel (for conversation continuity)
     const connector = this.connectors.get(qualifiedName);
     let existingSessionId: string | undefined;
+    let existingSessionLastMessageAt: string | undefined;
     if (connector) {
       try {
         const existingSession = await connector.sessionManager.getSession(event.metadata.channelId);
         if (existingSession) {
           existingSessionId = existingSession.sessionId;
+          existingSessionLastMessageAt = existingSession.lastMessageAt;
           logger.debug(
             `Resuming session for channel ${event.metadata.channelId}: ${existingSessionId}`,
           );
@@ -569,7 +571,14 @@ export class DiscordManager implements IChatManager {
       // Handle voice messages: transcribe audio before triggering the agent
       const authorPrefix = `Current user message from ${event.metadata.username} (<@${event.metadata.userId}>): `;
       let prompt = `${authorPrefix}${event.prompt}`;
+
+      if (event.metadata.repliedTo) {
+        const { authorName, timestamp, content } = event.metadata.repliedTo;
+        prompt = `Replying to [${authorName} at ${timestamp}]: ${content}\n${prompt}`;
+      }
+
       if (!existingSessionId && event.context.messages.length > 0) {
+        // Brand-new session: inject the full recent channel history.
         const priorContext = formatContextForPrompt(event.context);
         if (priorContext) {
           prompt = [
@@ -578,6 +587,26 @@ export class DiscordManager implements IChatManager {
             "",
             prompt,
           ].join("\n");
+        }
+      } else if (existingSessionId && existingSessionLastMessageAt) {
+        // Resumed session: only messages posted after the session's last turn are new to
+        // the agent (e.g. schedule-job posts, other bots/humans). `lastMessageAt` is
+        // written by setSession() once the previous job finished, so the bot's own last
+        // reply is excluded here.
+        const cutoffMs = new Date(existingSessionLastMessageAt).getTime();
+        const newMessages = event.context.messages.filter(
+          (msg) => new Date(msg.timestamp).getTime() > cutoffMs,
+        );
+        if (newMessages.length > 0) {
+          const newContext = formatContextForPrompt({ ...event.context, messages: newMessages });
+          if (newContext) {
+            prompt = [
+              "Messages posted in this channel since your last turn:",
+              newContext,
+              "",
+              prompt,
+            ].join("\n");
+          }
         }
       }
 
