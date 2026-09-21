@@ -593,8 +593,11 @@ export class DiscordManager implements IChatManager {
         // the agent (e.g. schedule-job posts, other bots/humans). `lastMessageAt` is
         // written by setSession() once the previous job finished, so the bot's own last
         // reply is excluded here.
+        // Use `allMessages` (the full fetched+filtered window), not `messages`
+        // (which `prioritizeUserMessages` may have capped, dropping an older
+        // bot/schedule post that is still newer than lastMessageAt).
         const cutoffMs = new Date(existingSessionLastMessageAt).getTime();
-        const newMessages = event.context.messages.filter(
+        const newMessages = (event.context.allMessages ?? event.context.messages).filter(
           (msg) => new Date(msg.timestamp).getTime() > cutoffMs,
         );
         if (newMessages.length > 0) {
@@ -1316,6 +1319,7 @@ export class DiscordManager implements IChatManager {
       prompt,
       context: {
         messages: [],
+        allMessages: [],
         prompt,
         wasMentioned: false,
       },

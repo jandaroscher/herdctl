@@ -64,6 +64,15 @@ export interface ContextBuildOptions {
 export interface ConversationContext {
   /** Processed messages in chronological order (oldest first) */
   messages: ContextMessage[];
+  /**
+   * The full fetched+filtered window (up to fetchLimit), before the
+   * `prioritizeUserMessages` cap that `messages` applies. Consumers that need
+   * to find a specific message (e.g. a bot/schedule post) regardless of the
+   * user-prioritization cutoff should use this instead of `messages`.
+   * Always populated by `buildConversationContext`; optional here only so
+   * hand-built contexts (tests, synthetic events) don't all need updating.
+   */
+  allMessages?: ContextMessage[];
   /** The triggering message with mention stripped */
   prompt: string;
   /** Whether the bot was mentioned in the triggering message */
@@ -345,6 +354,12 @@ export async function buildConversationContext(
       return true;
     });
 
+  // Full fetched+filtered window, sorted chronologically, before the
+  // prioritizeUserMessages cap below drops any messages.
+  const allMessages = [...processedMessages].sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+  );
+
   // If prioritizing user messages, sort to put user messages first
   // then take the limit, then re-sort by timestamp
   if (prioritizeUserMessages && processedMessages.length > maxMessages) {
@@ -371,6 +386,7 @@ export async function buildConversationContext(
 
   return {
     messages: processedMessages,
+    allMessages,
     prompt,
     wasMentioned,
   };
