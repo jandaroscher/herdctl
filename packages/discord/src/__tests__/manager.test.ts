@@ -2133,6 +2133,107 @@ describe("DiscordManager handleMessage pipeline", () => {
     expect(textCalls[0][0]).toBe("Let me check the file.");
     expect(textCalls[1][0]).toBe("The file has 42 lines.");
   });
+
+  // ---- vulpes-pack#649: a turn produced after a background-task notification ----
+
+  it("relays a second delta-streamed turn as its own message after a background-task notification", async () => {
+    const { manager, connector } = buildManagerWithTrigger(
+      async (...args: unknown[]) => {
+        const options = args[2] as { onMessage?: (m: unknown) => Promise<void> } | undefined;
+        if (options?.onMessage) {
+          // Turn 1: delta-streamed, then finalized.
+          await options.onMessage({
+            type: "stream_event",
+            event: { type: "content_block_delta", delta: { type: "text_delta", text: "First " } },
+          });
+          await options.onMessage({
+            type: "stream_event",
+            event: { type: "content_block_delta", delta: { type: "text_delta", text: "turn." } },
+          });
+          await options.onMessage({
+            type: "assistant",
+            message: {
+              id: "msg_1",
+              stop_reason: "end_turn",
+              content: [{ type: "text", text: "First turn." }],
+            },
+          });
+          // Turn 1's terminal `result` — the job-executor keeps draining for a
+          // follow-up turn behind this (a live background task / task
+          // notification), so this is NOT the end of the onMessage stream.
+          await options.onMessage({ type: "result", result: "First turn." });
+
+          // The background task's completion lands as a user-role message —
+          // not itself relayed, but what triggers turn 2 below.
+          await options.onMessage({
+            type: "user",
+            message: { content: [{ type: "text", text: "[task_notification] done" }] },
+          });
+
+          // Turn 2: delta-streamed, then finalized — produced by the SAME
+          // job/trigger() call, with no new user message from Discord.
+          await options.onMessage({
+            type: "stream_event",
+            event: { type: "content_block_delta", delta: { type: "text_delta", text: "Second " } },
+          });
+          await options.onMessage({
+            type: "stream_event",
+            event: { type: "content_block_delta", delta: { type: "text_delta", text: "turn." } },
+          });
+          await options.onMessage({
+            type: "assistant",
+            message: {
+              id: "msg_2",
+              stop_reason: "end_turn",
+              content: [{ type: "text", text: "Second turn." }],
+            },
+          });
+          await options.onMessage({ type: "result", result: "Second turn." });
+        }
+        return {
+          jobId: "j13",
+          agentName: "test-agent",
+          scheduleName: null,
+          startedAt: new Date().toISOString(),
+          success: true,
+          sessionId: "sid13",
+        };
+      },
+      {
+        chat: {
+          discord: {
+            bot_token_env: "TEST_BOT_TOKEN",
+            session_expiry_hours: 24,
+            log_level: "standard",
+            output: {
+              tool_results: true,
+              tool_result_max_length: 900,
+              system_status: true,
+              result_summary: false,
+              typing_indicator: true,
+              errors: true,
+              acknowledge_emoji: "",
+              assistant_messages: "all" as const,
+              progress_indicator: false,
+            },
+            guilds: [],
+          },
+        },
+      } as Partial<ReturnType<typeof createDiscordAgent>>,
+    );
+
+    await manager.start();
+    const { event, replyWithRef } = createMessageEvent();
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 2500)); // wait for rate limiting
+
+    // Each turn's delta-streamed answer must create its OWN live Discord
+    // message. Reusing turn 1's handle for turn 2 (the bug) means turn 2's
+    // deltas get appended onto turn 1's stale text and edited into turn 1's
+    // already-sent message instead of a new one — so replyWithRef is only
+    // ever called once instead of twice, and turn 1's content is lost.
+    expect(replyWithRef.mock.calls.length).toBe(2);
+  });
 });
 
 // Message handling tests are skipped pending refactor to work with the new architecture

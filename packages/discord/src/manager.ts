@@ -986,6 +986,22 @@ export class DiscordManager implements IChatManager {
             }
 
             if (normalized.kind === "result") {
+              // A `result` marks the end of ONE model turn, not necessarily of
+              // the whole job: the job-executor keeps draining for a follow-up
+              // turn behind a live background task, an injected message, or an
+              // undelivered task notification (see job-executor.ts's
+              // `awaitingFollowUpTurn` handling) and that follow-up turn can
+              // arrive here with its own delta stream. Reset the live-streamed-
+              // message state so that turn creates its OWN Discord message via
+              // `replyWithRef` instead of appending its deltas onto — and then
+              // overwriting — whatever turn last held `liveAnswerHandle`
+              // (vulpes-pack#649: the second turn silently overwrote the
+              // first's already-delivered message and was never relayed as its
+              // own message).
+              liveAnswerHandle = null;
+              liveAnswerText = "";
+              streamedDeltaSinceFinal = false;
+
               if (normalized.resultText) {
                 resultText = normalized.resultText;
               }
