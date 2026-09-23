@@ -1187,6 +1187,69 @@ describe("DiscordManager handleMessage pipeline", () => {
     return { event, reply: replyFn, replyWithRef: replyWithRefFn };
   }
 
+  // ---- prompt assembly: prior-context prefix must not drop the current author ----
+
+  it("labels the current message with its author when prior channel context is prepended", async () => {
+    let capturedPrompt: string | undefined;
+    const { manager, connector } = buildManagerWithTrigger(async (...args: unknown[]) => {
+      capturedPrompt = (args[2] as { prompt: string }).prompt;
+      return {
+        jobId: "j1",
+        agentName: "test-agent",
+        scheduleName: null,
+        startedAt: new Date().toISOString(),
+        success: true,
+        sessionId: "sid1",
+      };
+    });
+
+    await manager.start();
+
+    // Fresh session (connector.sessionManager.getSession resolves null by default)
+    // with non-empty prior context, from a different author than the current message.
+    const event = {
+      agentName: "test-agent",
+      prompt: "What's the status?",
+      context: {
+        messages: [
+          {
+            authorId: "user-julia",
+            authorName: "Julia",
+            content: "Can you check the deploy?",
+            isBot: false,
+            isSelf: false,
+            timestamp: "2026-09-18T09:00:00.000Z",
+            messageId: "msg-prior",
+          },
+        ],
+        wasMentioned: true,
+        prompt: "What's the status?",
+      },
+      metadata: {
+        guildId: "guild1",
+        channelId: "channel1",
+        messageId: "msg2",
+        userId: "user-david",
+        username: "David",
+        wasMentioned: true,
+        mode: "mention" as const,
+      },
+      reply: vi.fn().mockResolvedValue(undefined),
+      startTyping: () => () => {},
+      addReaction: vi.fn().mockResolvedValue(undefined),
+      removeReaction: vi.fn().mockResolvedValue(undefined),
+      replyWithRef: vi.fn().mockResolvedValue({
+        edit: vi.fn().mockResolvedValue(undefined),
+        delete: vi.fn().mockResolvedValue(undefined),
+      }),
+    } as unknown as DiscordMessageEvent;
+
+    connector.emit("message", event);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    expect(capturedPrompt).toContain("Current user message (from David): What's the status?");
+  });
+
   // ---- answers mode: suppresses reasoning turns, sends answer turns ----
 
   it("suppresses reasoning turns (text + tool_use) in 'answers' mode", async () => {
