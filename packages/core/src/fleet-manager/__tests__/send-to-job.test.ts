@@ -58,6 +58,7 @@ vi.mock("@anthropic-ai/claude-agent-sdk", () => ({
   }),
 }));
 
+import { JobExecutor } from "../../runner/job-executor.js";
 import { FleetManager } from "../fleet-manager.js";
 
 describe("FleetManager.sendToJob", () => {
@@ -130,6 +131,31 @@ describe("FleetManager.sendToJob", () => {
 
     // Handle dropped once the job finished.
     expect(manager.sendToJob(jobId as string, "too late")).toBe(false);
+  });
+
+  it("passes injectionGraceMs through to the job executor", async () => {
+    const executeSpy = vi.spyOn(JobExecutor.prototype, "execute");
+    const manager = createManager();
+    await manager.initialize();
+
+    let jobId: string | undefined;
+    const run = manager.trigger("chatty", undefined, {
+      prompt: "initial",
+      interactive: true,
+      injectionGraceMs: 15_000,
+      onJobCreated: (id) => {
+        jobId = id;
+      },
+    });
+    let delivered = false;
+    for (let attempt = 0; attempt < 200 && !delivered; attempt++) {
+      if (jobId) delivered = manager.sendToJob(jobId, "injected mid-run");
+      if (!delivered) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    await run;
+
+    expect(executeSpy).toHaveBeenCalledWith(expect.objectContaining({ injectionGraceMs: 15_000 }));
+    executeSpy.mockRestore();
   });
 
   it("returns false for an unknown job", async () => {

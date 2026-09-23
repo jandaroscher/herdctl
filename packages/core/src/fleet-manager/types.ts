@@ -616,6 +616,13 @@ export interface TriggerOptions {
   sessionTimeoutMs?: number;
 
   /**
+   * How long a session-backed run stays open after a terminal result for the
+   * follow-up turn of injected input (default `DEFAULT_INJECTION_GRACE_MS`,
+   * 60s). Only meaningful together with {@link interactive}.
+   */
+  injectionGraceMs?: number;
+
+  /**
    * Session ID to FORK for this trigger.
    *
    * When provided, the agent resumes `fork`'s transcript as context but writes

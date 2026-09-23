@@ -31,7 +31,6 @@ import type {
 import {
   createFileSenderDef,
   type FileSenderContext,
-  getToolInputSummary,
   type SDKMessage,
   TOOL_EMOJIS,
 } from "@herdctl/core";
@@ -57,6 +56,14 @@ import { transcribeAudio } from "./voice-transcriber.js";
 // =============================================================================
 // Constants
 // =============================================================================
+
+/**
+ * Grace period after a message was injected into a running Discord job: how
+ * long the session stays open for the follow-up turn once the current turn
+ * ends. Shorter than the core default (60s) — in chat the follow-up turn
+ * starts right away or the message was folded into the finished turn.
+ */
+const DISCORD_INJECTION_GRACE_MS = 15_000;
 
 // =============================================================================
 // Discord Manager
@@ -98,6 +105,13 @@ export class DiscordManager implements IChatManager {
   private connectors: Map<string, DiscordConnector> = new Map();
   private activeJobsByChannel: Map<string, string> = new Map();
   private lastPromptByChannel: Map<string, string> = new Map();
+  /**
+   * In-flight message handling per channel key (channel or thread id). Settles
+   * when that message's job has finished. See {@link handleMessage}.
+   */
+  private channelRuns: Map<string, Promise<void>> = new Map();
+  /** Messages injected into a channel's running job (for the done reaction). */
+  private injectedByChannel: Map<string, DiscordMessageEvent[]> = new Map();
   private lastUsageByChannel: Map<string, ChannelRunUsage> = new Map();
   private cumulativeUsageByAgent: Map<string, CumulativeUsage> = new Map();
   private initialized: boolean = false;
@@ -419,6 +433,90 @@ export class DiscordManager implements IChatManager {
    * @param event - The Discord message event
    */
   private async handleMessage(qualifiedName: string, event: DiscordMessageEvent): Promise<void> {
+    // One live session per channel (a thread has its own channel id). While a
+    // job runs for this channel, a new message is injected into that job's
+    // session as a new user turn instead of starting a second, parallel job
+    // that would not see the first one's conversation (and vice versa). Its
+    // answer is delivered by the running job's per-turn relay. Only when
+    // injection is impossible (job not session-backed yet, already winding
+    // down, or a voice/attachment message that needs the full pipeline) do we
+    // wait for the running job to finish and then start the next one, which
+    // resumes the channel session and sees everything posted meanwhile via the
+    // "since your last turn" block.
+    const channelKey = this.getChannelKey(qualifiedName, event.metadata.channelId);
+    for (
+      let running = this.channelRuns.get(channelKey);
+      running;
+      running = this.channelRuns.get(channelKey)
+    ) {
+      if (await this.injectIntoRunningJob(qualifiedName, channelKey, event)) {
+        return;
+      }
+      await running;
+    }
+
+    let release!: () => void;
+    const run = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.channelRuns.set(channelKey, run);
+    try {
+      await this.runMessage(qualifiedName, event);
+    } finally {
+      if (this.channelRuns.get(channelKey) === run) {
+        this.channelRuns.delete(channelKey);
+      }
+      release();
+    }
+  }
+
+  /**
+   * Push a message into the channel's running session-backed job.
+   * @returns true when the job accepted it (see FleetManager.sendToJob).
+   */
+  private async injectIntoRunningJob(
+    qualifiedName: string,
+    channelKey: string,
+    event: DiscordMessageEvent,
+  ): Promise<boolean> {
+    const jobId = this.activeJobsByChannel.get(channelKey);
+    if (!jobId || event.metadata.isVoiceMessage || (event.metadata.attachments?.length ?? 0) > 0) {
+      return false;
+    }
+    const fleetManager = this.ctx.getEmitter() as unknown as {
+      sendToJob?: (jobId: string, text: string) => boolean;
+    };
+    let text = `Current user message from ${event.metadata.username} (<@${event.metadata.userId}>): ${event.prompt}`;
+    if (event.metadata.repliedTo) {
+      const { authorName, timestamp, content } = event.metadata.repliedTo;
+      text = `Replying to [${authorName} at ${timestamp}]: ${content}\n${text}`;
+    }
+    if (fleetManager.sendToJob?.(jobId, text) !== true) {
+      return false;
+    }
+    const logger = this.ctx.getLogger();
+    logger.info(`Discord message for agent '${qualifiedName}' injected into running job ${jobId}`);
+    this.lastPromptByChannel.set(channelKey, event.prompt);
+    this.injectedByChannel.set(channelKey, [
+      ...(this.injectedByChannel.get(channelKey) ?? []),
+      event,
+    ]);
+    const agent = this.ctx.getConfig()?.agents.find((a) => a.qualifiedName === qualifiedName);
+    // Same default as runMessage: 👀 only when no output block is configured.
+    const ackEmoji = agent?.chat?.discord?.output
+      ? agent.chat.discord.output.acknowledge_emoji
+      : "👀";
+    if (ackEmoji) {
+      try {
+        await event.addReaction(ackEmoji);
+      } catch (reactionError) {
+        logger.warn(`Failed to add ack reaction: ${(reactionError as Error).message}`);
+      }
+    }
+    return true;
+  }
+
+  private async runMessage(qualifiedName: string, event: DiscordMessageEvent): Promise<void> {
     const logger = this.ctx.getLogger();
     const emitter = this.ctx.getEmitter();
 
@@ -548,6 +646,8 @@ export class DiscordManager implements IChatManager {
         logger.warn(`Failed to add ack reaction: ${(reactionError as Error).message}`);
       }
     }
+
+    let runSucceeded = false;
 
     // Attachment state — declared here so the finally block can clean up
     let attachmentDownloadedPaths: string[] = [];
@@ -744,6 +844,7 @@ export class DiscordManager implements IChatManager {
       let liveAnswerHandle: { edit: (c: any) => Promise<void> } | null = null;
       let liveAnswerText = "";
       let latestStatusText = "Preparing run…";
+      const runStartedAt = Date.now();
 
       const refreshRunCard = async (status: "running" | "success" | "error") => {
         if (!showProgressIndicator) {
@@ -754,8 +855,13 @@ export class DiscordManager implements IChatManager {
           return;
         }
         lastProgressUpdate = now;
+        const elapsedS = Math.round((now - runStartedAt) / 1000);
+        const elapsed =
+          elapsedS >= 60 ? `${Math.floor(elapsedS / 60)}m ${elapsedS % 60}s` : `${elapsedS}s`;
         const header =
-          toolNamesRun.length > 0 ? `Running · ${toolNamesRun.join("  →  ")}` : "Running";
+          toolNamesRun.length > 0
+            ? `Running (${elapsed}) · ${toolNamesRun.slice(-5).join("  →  ")}`
+            : `Running (${elapsed})`;
         const message = status === "running" ? `${header}\n${latestStatusText}` : latestStatusText;
         const embedPayload = {
           embeds: [
@@ -806,6 +912,12 @@ export class DiscordManager implements IChatManager {
       const result = await this.ctx.trigger(qualifiedName, undefined, {
         triggerType: "discord",
         prompt,
+        // Session-backed so follow-up messages in this channel can be pushed
+        // into the running job (handleMessage). Ignored by cli/docker runtimes.
+        interactive: true,
+        // A chat reply that folds into the running turn should not hold the
+        // session (and its concurrency slot) open for the core default of 60s.
+        injectionGraceMs: DISCORD_INJECTION_GRACE_MS,
         resume: existingSessionId ?? null,
         sessionKey: `${qualifiedName}--discord-${event.metadata.channelId}`,
         injectedMcpServers,
@@ -859,10 +971,9 @@ export class DiscordManager implements IChatManager {
                   if (toolNamesRun.length > 50) {
                     toolNamesRun.splice(0, toolNamesRun.length - 50);
                   }
-                  const inputSummary = getToolInputSummary(block.name, block.input);
-                  pushTraceLine(
-                    `${emoji} ${block.name}${inputSummary ? ` · ${inputSummary.slice(0, 60)}` : ""}`,
-                  );
+                  // Tool name only: arguments and outputs can carry paths,
+                  // commands or secrets and must not land in the channel.
+                  pushTraceLine(`${emoji} ${block.name}`);
                   latestStatusText = `Executing ${block.name}`;
                   await refreshRunCard("running");
                 }
@@ -924,10 +1035,7 @@ export class DiscordManager implements IChatManager {
                 }
                 const toolName = toolUse?.name ?? "Tool";
                 const output = toolResult.output.trim();
-                const preview = output.length > 0 ? output.replace(/\s+/g, " ").slice(0, 90) : "";
-                pushTraceLine(
-                  `${toolResult.isError ? "✖" : "✓"} ${toolName}${preview ? ` · ${preview}` : ""}`,
-                );
+                pushTraceLine(`${toolResult.isError ? "✖" : "✓"} ${toolName}`);
                 latestStatusText = `${toolResult.isError ? "Error from" : "Completed"} ${toolName}`;
                 await refreshRunCard("running");
 
@@ -1059,6 +1167,8 @@ export class DiscordManager implements IChatManager {
         },
       });
 
+      runSucceeded = result.success;
+
       // Stop typing indicator immediately after SDK execution completes
       // This prevents the interval from firing during flush/session storage
       if (!typingStopped) {
@@ -1089,23 +1199,6 @@ export class DiscordManager implements IChatManager {
       logger.debug(
         `Discord job completed: ${result.jobId} for agent '${qualifiedName}'${result.sessionId ? ` (session: ${result.sessionId})` : ""}`,
       );
-
-      if (progressState.handle) {
-        try {
-          await progressState.handle.edit({
-            embeds: [
-              buildRunCardEmbed({
-                agentName: qualifiedName,
-                status: result.success ? "success" : "error",
-                message: result.success ? "Task complete" : "Task failed",
-                traceLines,
-              }),
-            ],
-          });
-        } catch (progressError) {
-          logger.warn(`Failed to finalize run card: ${(progressError as Error).message}`);
-        }
-      }
 
       // If no text messages were sent, send an appropriate fallback.
       // When embedsSent > 0 but no text was delivered, the user saw tool/result embeds
@@ -1171,23 +1264,6 @@ export class DiscordManager implements IChatManager {
       const err = error instanceof Error ? error : new Error(String(error));
       logger.error(`Discord message handling failed for agent '${qualifiedName}': ${err.message}`);
 
-      if (progressState.handle) {
-        try {
-          await progressState.handle.edit({
-            embeds: [
-              buildRunCardEmbed({
-                agentName: qualifiedName,
-                status: "error",
-                message: `Task failed · ${err.message}`,
-                traceLines,
-              }),
-            ],
-          });
-        } catch (progressError) {
-          logger.warn(`Failed to finalize failed run card: ${(progressError as Error).message}`);
-        }
-      }
-
       // Send user-friendly error message using the formatted error method
       try {
         await event.reply(this.formatErrorMessage(err, qualifiedName));
@@ -1205,17 +1281,33 @@ export class DiscordManager implements IChatManager {
       });
     } finally {
       this.activeJobsByChannel.delete(this.getChannelKey(qualifiedName, event.metadata.channelId));
+      // The run card is a live status while the job runs; the answer (or the
+      // error reply) is the result, so the card goes away.
+      if (progressState.handle) {
+        try {
+          await progressState.handle.delete();
+        } catch (progressError) {
+          logger.warn(`Failed to delete run card: ${(progressError as Error).message}`);
+        }
+      }
       // Safety net: stop typing indicator if not already stopped
       // (Should already be stopped after sending messages, but this ensures cleanup on errors)
       if (!typingStopped) {
         stopTyping();
       }
-      // Remove acknowledgement reaction now that processing is complete
+      // Swap the acknowledgement reaction for a done/failed marker on this
+      // message and on every message injected into this run.
+      const channelKey = this.getChannelKey(qualifiedName, event.metadata.channelId);
+      const handled = [event, ...(this.injectedByChannel.get(channelKey) ?? [])];
+      this.injectedByChannel.delete(channelKey);
       if (ackEmoji) {
-        try {
-          await event.removeReaction(ackEmoji);
-        } catch (reactionError) {
-          logger.warn(`Failed to remove ack reaction: ${(reactionError as Error).message}`);
+        for (const handledEvent of handled) {
+          try {
+            await handledEvent.removeReaction(ackEmoji);
+            await handledEvent.addReaction(runSucceeded ? "✅" : "❌");
+          } catch (reactionError) {
+            logger.warn(`Failed to update ack reaction: ${(reactionError as Error).message}`);
+          }
         }
       }
       // Clean up downloaded attachment files if configured
@@ -1562,19 +1654,19 @@ export class DiscordManager implements IChatManager {
     });
 
     this.lastPromptByChannel.set(key, prompt);
-    void this.handleMessage(qualifiedName, syntheticEvent)
-      .catch(async (error: unknown) => {
-        const err = error instanceof Error ? error : new Error(String(error));
-        logger.error(`Background slash run failed for '${qualifiedName}': ${err.message}`);
-        try {
-          await textChannel.send(this.formatErrorMessage(err, qualifiedName));
-        } catch (replyError) {
-          logger.error(`Failed to send slash failure message: ${(replyError as Error).message}`);
-        }
-      })
-      .finally(() => {
-        this.activeJobsByChannel.delete(key);
-      });
+    void this.handleMessage(qualifiedName, syntheticEvent).catch(async (error: unknown) => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.error(`Background slash run failed for '${qualifiedName}': ${err.message}`);
+      try {
+        await textChannel.send(this.formatErrorMessage(err, qualifiedName));
+      } catch (replyError) {
+        logger.error(`Failed to send slash failure message: ${(replyError as Error).message}`);
+      }
+    });
+    // No cleanup of activeJobsByChannel here: handleMessage's own finally
+    // clears the entry for the job it started. Deleting by channel key here
+    // could drop the entry of a different job that is running in the channel
+    // by then (e.g. the retry prompt was injected into it).
 
     return {
       success: true,

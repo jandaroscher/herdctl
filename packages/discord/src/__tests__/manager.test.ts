@@ -293,6 +293,50 @@ describe("DiscordManager", () => {
       expect(event.metadata.channelId).toBe("channel-1");
     });
 
+    it("does not clear another job's channel entry when the retry run settles", async () => {
+      const ctx = createMockContext(null);
+      const manager = new DiscordManager(ctx);
+      const managerAny = manager as unknown as {
+        lastPromptByChannel: Map<string, string>;
+        activeJobsByChannel: Map<string, string>;
+        connectors: Map<string, unknown>;
+        retryChannelRun: (
+          qualifiedName: string,
+          channelId: string,
+        ) => Promise<{ success: boolean }>;
+        handleMessage: (qualifiedName: string, event: DiscordMessageEvent) => Promise<void>;
+      };
+      const mockChannel = {
+        isTextBased: () => true,
+        isDMBased: () => false,
+        guildId: "guild-1",
+        send: vi.fn().mockResolvedValue({ edit: vi.fn(), delete: vi.fn() }),
+      };
+      managerAny.connectors = new Map([
+        [
+          "agent-1",
+          {
+            client: {
+              isReady: () => true,
+              channels: { fetch: vi.fn().mockResolvedValue(mockChannel) },
+            },
+          },
+        ],
+      ]);
+      managerAny.lastPromptByChannel.set("agent-1:channel-1", "retry prompt");
+      // A regular message starts its own job while the retry is in flight;
+      // the retry itself ends up injected and starts nothing.
+      vi.spyOn(managerAny, "handleMessage").mockImplementation(async () => {
+        managerAny.activeJobsByChannel.set("agent-1:channel-1", "job-other");
+      });
+
+      const result = await managerAny.retryChannelRun("agent-1", "channel-1");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(result.success).toBe(true);
+      expect(managerAny.activeJobsByChannel.get("agent-1:channel-1")).toBe("job-other");
+    });
+
     it("catches background retry failures and posts an error message", async () => {
       const ctx = createMockContext(null);
       const manager = new DiscordManager(ctx);
@@ -1296,6 +1340,198 @@ describe("DiscordManager handleMessage pipeline", () => {
     const authorLine = "Current user message from TestUser (<@user1>): Hello bot!";
     expect(options.prompt.endsWith(authorLine)).toBe(true);
     expect(options.prompt.split(authorLine)).toHaveLength(2); // appears exactly once
+  });
+
+  // ---- one live session per channel (serialize concurrent messages) ----
+
+  describe("per-channel serialization", () => {
+    type TriggerOpts = {
+      prompt: string;
+      interactive?: boolean;
+      injectionGraceMs?: number;
+      onJobCreated?: (id: string) => void;
+    };
+
+    /** trigger() mock whose jobs stay running until finish(i) is called. */
+    function blockingTrigger() {
+      const calls: TriggerOpts[] = [];
+      const finishers: Array<() => void> = [];
+      const impl = async (...args: unknown[]) => {
+        const opts = args[2] as TriggerOpts;
+        const jobId = `job-${calls.length + 1}`;
+        calls.push(opts);
+        opts.onJobCreated?.(jobId);
+        await new Promise<void>((resolve) => finishers.push(resolve));
+        return {
+          jobId,
+          agentName: "test-agent",
+          scheduleName: null,
+          startedAt: "",
+          success: true,
+          sessionId: jobId,
+        };
+      };
+      return { calls, finish: (i: number) => finishers[i](), impl };
+    }
+
+    function messageIn(channelId: string, prompt: string, messageId: string) {
+      const { event } = createMessageEvent();
+      event.prompt = prompt;
+      event.metadata.channelId = channelId;
+      event.metadata.messageId = messageId;
+      return event;
+    }
+
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+    it("injects messages into the running job instead of starting a second job", async () => {
+      const t = blockingTrigger();
+      const { manager, connector, ctx } = buildManagerWithTrigger(t.impl);
+      const sendToJob = vi.fn().mockReturnValue(true);
+      (ctx.getEmitter() as unknown as { sendToJob: typeof sendToJob }).sendToJob = sendToJob;
+      await manager.start();
+
+      connector.emit("message", messageIn("c1", "A", "m1"));
+      await tick();
+      const b = messageIn("c1", "B", "m2");
+      connector.emit("message", b);
+      connector.emit("message", messageIn("c1", "C", "m3"));
+      await tick();
+
+      expect(t.calls).toHaveLength(1);
+      expect(t.calls[0].interactive).toBe(true);
+      expect(t.calls[0].injectionGraceMs).toBe(15_000);
+      expect(sendToJob).toHaveBeenCalledTimes(2);
+      expect(sendToJob).toHaveBeenNthCalledWith(
+        1,
+        "job-1",
+        "Current user message from TestUser (<@user1>): B",
+      );
+      expect(sendToJob).toHaveBeenNthCalledWith(
+        2,
+        "job-1",
+        "Current user message from TestUser (<@user1>): C",
+      );
+
+      // After the job ends, the next message starts exactly one new job.
+      t.finish(0);
+      await tick();
+      connector.emit("message", messageIn("c1", "D", "m4"));
+      await tick();
+      expect(t.calls).toHaveLength(2);
+      expect(sendToJob).toHaveBeenCalledTimes(2);
+    });
+
+    it("waits for the running job when injection is refused, then runs one job per waiter", async () => {
+      const t = blockingTrigger();
+      const { manager, connector, ctx } = buildManagerWithTrigger(t.impl);
+      (ctx.getEmitter() as unknown as { sendToJob: () => boolean }).sendToJob = () => false;
+      await manager.start();
+
+      connector.emit("message", messageIn("c1", "A", "m1"));
+      await tick();
+      connector.emit("message", messageIn("c1", "B", "m2"));
+      await tick();
+      expect(t.calls).toHaveLength(1); // B does not run in parallel
+
+      t.finish(0);
+      await tick();
+      expect(t.calls).toHaveLength(2);
+      expect(t.calls[1].prompt).toContain("B");
+      t.finish(1);
+    });
+
+    it("shows a live run card without tool args, then deletes it and marks messages done", async () => {
+      const calls: TriggerOpts[] = [];
+      let finish!: () => void;
+      const impl = async (...args: unknown[]) => {
+        const opts = args[2] as TriggerOpts & { onMessage?: (m: unknown) => Promise<void> };
+        calls.push(opts);
+        opts.onJobCreated?.("job-1");
+        await opts.onMessage?.({
+          type: "assistant",
+          message: {
+            id: "a1",
+            stop_reason: "tool_use",
+            content: [
+              { type: "tool_use", id: "t1", name: "Bash", input: { command: "echo SECRET" } },
+            ],
+          },
+        });
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        return {
+          jobId: "job-1",
+          agentName: "test-agent",
+          scheduleName: null,
+          startedAt: "",
+          success: true,
+        };
+      };
+      const base = createDiscordAgent("test-agent", {
+        bot_token_env: "TEST_BOT_TOKEN",
+        session_expiry_hours: 24,
+        log_level: "standard",
+        output: {
+          tool_results: false,
+          tool_result_max_length: 900,
+          system_status: true,
+          result_summary: false,
+          typing_indicator: true,
+          errors: true,
+          acknowledge_emoji: "👀",
+          assistant_messages: "all" as const,
+          progress_indicator: true,
+        },
+        guilds: [],
+      });
+      const { manager, connector, ctx } = buildManagerWithTrigger(impl, { chat: base.chat });
+      (ctx.getEmitter() as unknown as { sendToJob: () => boolean }).sendToJob = () => true;
+      await manager.start();
+
+      const { event: a, replyWithRef } = createMessageEvent();
+      a.metadata.channelId = "c1";
+      connector.emit("message", a);
+      await tick();
+      const b = messageIn("c1", "B", "m2");
+      connector.emit("message", b);
+      await tick();
+
+      expect(calls).toHaveLength(1);
+      expect(a.addReaction).toHaveBeenCalledWith("👀");
+      expect(b.addReaction).toHaveBeenCalledWith("👀");
+      expect(replyWithRef).toHaveBeenCalledTimes(1);
+      const card = JSON.stringify(replyWithRef.mock.calls[0][0]);
+      expect(card).toContain("Bash");
+      expect(card).toContain("Running (");
+      expect(card).not.toContain("SECRET");
+
+      finish();
+      await tick();
+      const handle = await replyWithRef.mock.results[0].value;
+      expect(handle.delete).toHaveBeenCalled();
+      for (const e of [a, b]) {
+        expect(e.removeReaction).toHaveBeenCalledWith("👀");
+        expect(e.addReaction).toHaveBeenCalledWith("✅");
+      }
+    });
+
+    it("keeps different channels running in parallel", async () => {
+      const t = blockingTrigger();
+      const { manager, connector, ctx } = buildManagerWithTrigger(t.impl);
+      const sendToJob = vi.fn().mockReturnValue(true);
+      (ctx.getEmitter() as unknown as { sendToJob: typeof sendToJob }).sendToJob = sendToJob;
+      await manager.start();
+
+      connector.emit("message", messageIn("c1", "A", "m1"));
+      connector.emit("message", messageIn("c2", "X", "m2"));
+      await tick();
+      expect(t.calls).toHaveLength(2);
+      expect(sendToJob).not.toHaveBeenCalled();
+      t.finish(0);
+      t.finish(1);
+    });
   });
 
   // ---- resumed-session context since last turn (vulpes-pack#629) ----
