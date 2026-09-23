@@ -31,7 +31,6 @@ import type {
 import {
   createFileSenderDef,
   type FileSenderContext,
-  getToolInputSummary,
   type SDKMessage,
   TOOL_EMOJIS,
 } from "@herdctl/core";
@@ -103,6 +102,8 @@ export class DiscordManager implements IChatManager {
    * when that message's job has finished. See {@link handleMessage}.
    */
   private channelRuns: Map<string, Promise<void>> = new Map();
+  /** Messages injected into a channel's running job (for the done reaction). */
+  private injectedByChannel: Map<string, DiscordMessageEvent[]> = new Map();
   private lastUsageByChannel: Map<string, ChannelRunUsage> = new Map();
   private cumulativeUsageByAgent: Map<string, CumulativeUsage> = new Map();
   private initialized: boolean = false;
@@ -488,6 +489,10 @@ export class DiscordManager implements IChatManager {
     const logger = this.ctx.getLogger();
     logger.info(`Discord message for agent '${qualifiedName}' injected into running job ${jobId}`);
     this.lastPromptByChannel.set(channelKey, event.prompt);
+    this.injectedByChannel.set(channelKey, [
+      ...(this.injectedByChannel.get(channelKey) ?? []),
+      event,
+    ]);
     const agent = this.ctx.getConfig()?.agents.find((a) => a.qualifiedName === qualifiedName);
     // Same default as runMessage: 👀 only when no output block is configured.
     const ackEmoji = agent?.chat?.discord?.output
@@ -633,6 +638,8 @@ export class DiscordManager implements IChatManager {
         logger.warn(`Failed to add ack reaction: ${(reactionError as Error).message}`);
       }
     }
+
+    let runSucceeded = false;
 
     // Attachment state — declared here so the finally block can clean up
     let attachmentDownloadedPaths: string[] = [];
@@ -829,6 +836,7 @@ export class DiscordManager implements IChatManager {
       let liveAnswerHandle: { edit: (c: any) => Promise<void> } | null = null;
       let liveAnswerText = "";
       let latestStatusText = "Preparing run…";
+      const runStartedAt = Date.now();
 
       const refreshRunCard = async (status: "running" | "success" | "error") => {
         if (!showProgressIndicator) {
@@ -839,8 +847,13 @@ export class DiscordManager implements IChatManager {
           return;
         }
         lastProgressUpdate = now;
+        const elapsedS = Math.round((now - runStartedAt) / 1000);
+        const elapsed =
+          elapsedS >= 60 ? `${Math.floor(elapsedS / 60)}m ${elapsedS % 60}s` : `${elapsedS}s`;
         const header =
-          toolNamesRun.length > 0 ? `Running · ${toolNamesRun.join("  →  ")}` : "Running";
+          toolNamesRun.length > 0
+            ? `Running (${elapsed}) · ${toolNamesRun.slice(-5).join("  →  ")}`
+            : `Running (${elapsed})`;
         const message = status === "running" ? `${header}\n${latestStatusText}` : latestStatusText;
         const embedPayload = {
           embeds: [
@@ -947,10 +960,9 @@ export class DiscordManager implements IChatManager {
                   if (toolNamesRun.length > 50) {
                     toolNamesRun.splice(0, toolNamesRun.length - 50);
                   }
-                  const inputSummary = getToolInputSummary(block.name, block.input);
-                  pushTraceLine(
-                    `${emoji} ${block.name}${inputSummary ? ` · ${inputSummary.slice(0, 60)}` : ""}`,
-                  );
+                  // Tool name only: arguments and outputs can carry paths,
+                  // commands or secrets and must not land in the channel.
+                  pushTraceLine(`${emoji} ${block.name}`);
                   latestStatusText = `Executing ${block.name}`;
                   await refreshRunCard("running");
                 }
@@ -1012,10 +1024,7 @@ export class DiscordManager implements IChatManager {
                 }
                 const toolName = toolUse?.name ?? "Tool";
                 const output = toolResult.output.trim();
-                const preview = output.length > 0 ? output.replace(/\s+/g, " ").slice(0, 90) : "";
-                pushTraceLine(
-                  `${toolResult.isError ? "✖" : "✓"} ${toolName}${preview ? ` · ${preview}` : ""}`,
-                );
+                pushTraceLine(`${toolResult.isError ? "✖" : "✓"} ${toolName}`);
                 latestStatusText = `${toolResult.isError ? "Error from" : "Completed"} ${toolName}`;
                 await refreshRunCard("running");
 
@@ -1147,6 +1156,8 @@ export class DiscordManager implements IChatManager {
         },
       });
 
+      runSucceeded = result.success;
+
       // Stop typing indicator immediately after SDK execution completes
       // This prevents the interval from firing during flush/session storage
       if (!typingStopped) {
@@ -1177,23 +1188,6 @@ export class DiscordManager implements IChatManager {
       logger.debug(
         `Discord job completed: ${result.jobId} for agent '${qualifiedName}'${result.sessionId ? ` (session: ${result.sessionId})` : ""}`,
       );
-
-      if (progressState.handle) {
-        try {
-          await progressState.handle.edit({
-            embeds: [
-              buildRunCardEmbed({
-                agentName: qualifiedName,
-                status: result.success ? "success" : "error",
-                message: result.success ? "Task complete" : "Task failed",
-                traceLines,
-              }),
-            ],
-          });
-        } catch (progressError) {
-          logger.warn(`Failed to finalize run card: ${(progressError as Error).message}`);
-        }
-      }
 
       // If no text messages were sent, send an appropriate fallback.
       // When embedsSent > 0 but no text was delivered, the user saw tool/result embeds
@@ -1259,23 +1253,6 @@ export class DiscordManager implements IChatManager {
       const err = error instanceof Error ? error : new Error(String(error));
       logger.error(`Discord message handling failed for agent '${qualifiedName}': ${err.message}`);
 
-      if (progressState.handle) {
-        try {
-          await progressState.handle.edit({
-            embeds: [
-              buildRunCardEmbed({
-                agentName: qualifiedName,
-                status: "error",
-                message: `Task failed · ${err.message}`,
-                traceLines,
-              }),
-            ],
-          });
-        } catch (progressError) {
-          logger.warn(`Failed to finalize failed run card: ${(progressError as Error).message}`);
-        }
-      }
-
       // Send user-friendly error message using the formatted error method
       try {
         await event.reply(this.formatErrorMessage(err, qualifiedName));
@@ -1293,17 +1270,33 @@ export class DiscordManager implements IChatManager {
       });
     } finally {
       this.activeJobsByChannel.delete(this.getChannelKey(qualifiedName, event.metadata.channelId));
+      // The run card is a live status while the job runs; the answer (or the
+      // error reply) is the result, so the card goes away.
+      if (progressState.handle) {
+        try {
+          await progressState.handle.delete();
+        } catch (progressError) {
+          logger.warn(`Failed to delete run card: ${(progressError as Error).message}`);
+        }
+      }
       // Safety net: stop typing indicator if not already stopped
       // (Should already be stopped after sending messages, but this ensures cleanup on errors)
       if (!typingStopped) {
         stopTyping();
       }
-      // Remove acknowledgement reaction now that processing is complete
+      // Swap the acknowledgement reaction for a done/failed marker on this
+      // message and on every message injected into this run.
+      const channelKey = this.getChannelKey(qualifiedName, event.metadata.channelId);
+      const handled = [event, ...(this.injectedByChannel.get(channelKey) ?? [])];
+      this.injectedByChannel.delete(channelKey);
       if (ackEmoji) {
-        try {
-          await event.removeReaction(ackEmoji);
-        } catch (reactionError) {
-          logger.warn(`Failed to remove ack reaction: ${(reactionError as Error).message}`);
+        for (const handledEvent of handled) {
+          try {
+            await handledEvent.removeReaction(ackEmoji);
+            await handledEvent.addReaction(runSucceeded ? "✅" : "❌");
+          } catch (reactionError) {
+            logger.warn(`Failed to update ack reaction: ${(reactionError as Error).message}`);
+          }
         }
       }
       // Clean up downloaded attachment files if configured

@@ -1395,6 +1395,82 @@ describe("DiscordManager handleMessage pipeline", () => {
       t.finish(1);
     });
 
+    it("shows a live run card without tool args, then deletes it and marks messages done", async () => {
+      const calls: TriggerOpts[] = [];
+      let finish!: () => void;
+      const impl = async (...args: unknown[]) => {
+        const opts = args[2] as TriggerOpts & { onMessage?: (m: unknown) => Promise<void> };
+        calls.push(opts);
+        opts.onJobCreated?.("job-1");
+        await opts.onMessage?.({
+          type: "assistant",
+          message: {
+            id: "a1",
+            stop_reason: "tool_use",
+            content: [
+              { type: "tool_use", id: "t1", name: "Bash", input: { command: "echo SECRET" } },
+            ],
+          },
+        });
+        await new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        return {
+          jobId: "job-1",
+          agentName: "test-agent",
+          scheduleName: null,
+          startedAt: "",
+          success: true,
+        };
+      };
+      const base = createDiscordAgent("test-agent", {
+        bot_token_env: "TEST_BOT_TOKEN",
+        session_expiry_hours: 24,
+        log_level: "standard",
+        output: {
+          tool_results: false,
+          tool_result_max_length: 900,
+          system_status: true,
+          result_summary: false,
+          typing_indicator: true,
+          errors: true,
+          acknowledge_emoji: "👀",
+          assistant_messages: "all" as const,
+          progress_indicator: true,
+        },
+        guilds: [],
+      });
+      const { manager, connector, ctx } = buildManagerWithTrigger(impl, { chat: base.chat });
+      (ctx.getEmitter() as unknown as { sendToJob: () => boolean }).sendToJob = () => true;
+      await manager.start();
+
+      const { event: a, replyWithRef } = createMessageEvent();
+      a.metadata.channelId = "c1";
+      connector.emit("message", a);
+      await tick();
+      const b = messageIn("c1", "B", "m2");
+      connector.emit("message", b);
+      await tick();
+
+      expect(calls).toHaveLength(1);
+      expect(a.addReaction).toHaveBeenCalledWith("👀");
+      expect(b.addReaction).toHaveBeenCalledWith("👀");
+      expect(replyWithRef).toHaveBeenCalledTimes(1);
+      const card = JSON.stringify(replyWithRef.mock.calls[0][0]);
+      expect(card).toContain("Bash");
+      expect(card).toContain("Running (");
+      expect(card).not.toContain("SECRET");
+
+      finish();
+      await tick();
+      const handle = await replyWithRef.mock.results[0].value;
+      expect(handle.delete).toHaveBeenCalled();
+      for (const e of [a, b]) {
+        expect(e.removeReaction).toHaveBeenCalledWith("👀");
+        expect(e.addReaction).toHaveBeenCalledWith("✅");
+      }
+    });
+
     it("keeps different channels running in parallel", async () => {
       const t = blockingTrigger();
       const { manager, connector, ctx } = buildManagerWithTrigger(t.impl);
