@@ -1298,6 +1298,120 @@ describe("DiscordManager handleMessage pipeline", () => {
     expect(options.prompt.split(authorLine)).toHaveLength(2); // appears exactly once
   });
 
+  // ---- one live session per channel (serialize concurrent messages) ----
+
+  describe("per-channel serialization", () => {
+    type TriggerOpts = {
+      prompt: string;
+      interactive?: boolean;
+      onJobCreated?: (id: string) => void;
+    };
+
+    /** trigger() mock whose jobs stay running until finish(i) is called. */
+    function blockingTrigger() {
+      const calls: TriggerOpts[] = [];
+      const finishers: Array<() => void> = [];
+      const impl = async (...args: unknown[]) => {
+        const opts = args[2] as TriggerOpts;
+        const jobId = `job-${calls.length + 1}`;
+        calls.push(opts);
+        opts.onJobCreated?.(jobId);
+        await new Promise<void>((resolve) => finishers.push(resolve));
+        return {
+          jobId,
+          agentName: "test-agent",
+          scheduleName: null,
+          startedAt: "",
+          success: true,
+          sessionId: jobId,
+        };
+      };
+      return { calls, finish: (i: number) => finishers[i](), impl };
+    }
+
+    function messageIn(channelId: string, prompt: string, messageId: string) {
+      const { event } = createMessageEvent();
+      event.prompt = prompt;
+      event.metadata.channelId = channelId;
+      event.metadata.messageId = messageId;
+      return event;
+    }
+
+    const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
+
+    it("injects messages into the running job instead of starting a second job", async () => {
+      const t = blockingTrigger();
+      const { manager, connector, ctx } = buildManagerWithTrigger(t.impl);
+      const sendToJob = vi.fn().mockReturnValue(true);
+      (ctx.getEmitter() as unknown as { sendToJob: typeof sendToJob }).sendToJob = sendToJob;
+      await manager.start();
+
+      connector.emit("message", messageIn("c1", "A", "m1"));
+      await tick();
+      const b = messageIn("c1", "B", "m2");
+      connector.emit("message", b);
+      connector.emit("message", messageIn("c1", "C", "m3"));
+      await tick();
+
+      expect(t.calls).toHaveLength(1);
+      expect(t.calls[0].interactive).toBe(true);
+      expect(sendToJob).toHaveBeenCalledTimes(2);
+      expect(sendToJob).toHaveBeenNthCalledWith(
+        1,
+        "job-1",
+        "Current user message from TestUser (<@user1>): B",
+      );
+      expect(sendToJob).toHaveBeenNthCalledWith(
+        2,
+        "job-1",
+        "Current user message from TestUser (<@user1>): C",
+      );
+
+      // After the job ends, the next message starts exactly one new job.
+      t.finish(0);
+      await tick();
+      connector.emit("message", messageIn("c1", "D", "m4"));
+      await tick();
+      expect(t.calls).toHaveLength(2);
+      expect(sendToJob).toHaveBeenCalledTimes(2);
+    });
+
+    it("waits for the running job when injection is refused, then runs one job per waiter", async () => {
+      const t = blockingTrigger();
+      const { manager, connector, ctx } = buildManagerWithTrigger(t.impl);
+      (ctx.getEmitter() as unknown as { sendToJob: () => boolean }).sendToJob = () => false;
+      await manager.start();
+
+      connector.emit("message", messageIn("c1", "A", "m1"));
+      await tick();
+      connector.emit("message", messageIn("c1", "B", "m2"));
+      await tick();
+      expect(t.calls).toHaveLength(1); // B does not run in parallel
+
+      t.finish(0);
+      await tick();
+      expect(t.calls).toHaveLength(2);
+      expect(t.calls[1].prompt).toContain("B");
+      t.finish(1);
+    });
+
+    it("keeps different channels running in parallel", async () => {
+      const t = blockingTrigger();
+      const { manager, connector, ctx } = buildManagerWithTrigger(t.impl);
+      const sendToJob = vi.fn().mockReturnValue(true);
+      (ctx.getEmitter() as unknown as { sendToJob: typeof sendToJob }).sendToJob = sendToJob;
+      await manager.start();
+
+      connector.emit("message", messageIn("c1", "A", "m1"));
+      connector.emit("message", messageIn("c2", "X", "m2"));
+      await tick();
+      expect(t.calls).toHaveLength(2);
+      expect(sendToJob).not.toHaveBeenCalled();
+      t.finish(0);
+      t.finish(1);
+    });
+  });
+
   // ---- resumed-session context since last turn (vulpes-pack#629) ----
 
   it("includes channel messages posted after the resumed session's lastMessageAt", async () => {

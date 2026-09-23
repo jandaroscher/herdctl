@@ -98,6 +98,11 @@ export class DiscordManager implements IChatManager {
   private connectors: Map<string, DiscordConnector> = new Map();
   private activeJobsByChannel: Map<string, string> = new Map();
   private lastPromptByChannel: Map<string, string> = new Map();
+  /**
+   * In-flight message handling per channel key (channel or thread id). Settles
+   * when that message's job has finished. See {@link handleMessage}.
+   */
+  private channelRuns: Map<string, Promise<void>> = new Map();
   private lastUsageByChannel: Map<string, ChannelRunUsage> = new Map();
   private cumulativeUsageByAgent: Map<string, CumulativeUsage> = new Map();
   private initialized: boolean = false;
@@ -419,6 +424,86 @@ export class DiscordManager implements IChatManager {
    * @param event - The Discord message event
    */
   private async handleMessage(qualifiedName: string, event: DiscordMessageEvent): Promise<void> {
+    // One live session per channel (a thread has its own channel id). While a
+    // job runs for this channel, a new message is injected into that job's
+    // session as a new user turn instead of starting a second, parallel job
+    // that would not see the first one's conversation (and vice versa). Its
+    // answer is delivered by the running job's per-turn relay. Only when
+    // injection is impossible (job not session-backed yet, already winding
+    // down, or a voice/attachment message that needs the full pipeline) do we
+    // wait for the running job to finish and then start the next one, which
+    // resumes the channel session and sees everything posted meanwhile via the
+    // "since your last turn" block.
+    const channelKey = this.getChannelKey(qualifiedName, event.metadata.channelId);
+    for (
+      let running = this.channelRuns.get(channelKey);
+      running;
+      running = this.channelRuns.get(channelKey)
+    ) {
+      if (await this.injectIntoRunningJob(qualifiedName, channelKey, event)) {
+        return;
+      }
+      await running;
+    }
+
+    let release!: () => void;
+    const run = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.channelRuns.set(channelKey, run);
+    try {
+      await this.runMessage(qualifiedName, event);
+    } finally {
+      if (this.channelRuns.get(channelKey) === run) {
+        this.channelRuns.delete(channelKey);
+      }
+      release();
+    }
+  }
+
+  /**
+   * Push a message into the channel's running session-backed job.
+   * @returns true when the job accepted it (see FleetManager.sendToJob).
+   */
+  private async injectIntoRunningJob(
+    qualifiedName: string,
+    channelKey: string,
+    event: DiscordMessageEvent,
+  ): Promise<boolean> {
+    const jobId = this.activeJobsByChannel.get(channelKey);
+    if (!jobId || event.metadata.isVoiceMessage || (event.metadata.attachments?.length ?? 0) > 0) {
+      return false;
+    }
+    const fleetManager = this.ctx.getEmitter() as unknown as {
+      sendToJob?: (jobId: string, text: string) => boolean;
+    };
+    let text = `Current user message from ${event.metadata.username} (<@${event.metadata.userId}>): ${event.prompt}`;
+    if (event.metadata.repliedTo) {
+      const { authorName, timestamp, content } = event.metadata.repliedTo;
+      text = `Replying to [${authorName} at ${timestamp}]: ${content}\n${text}`;
+    }
+    if (fleetManager.sendToJob?.(jobId, text) !== true) {
+      return false;
+    }
+    const logger = this.ctx.getLogger();
+    logger.info(`Discord message for agent '${qualifiedName}' injected into running job ${jobId}`);
+    this.lastPromptByChannel.set(channelKey, event.prompt);
+    const agent = this.ctx.getConfig()?.agents.find((a) => a.qualifiedName === qualifiedName);
+    // Same default as runMessage: 👀 only when no output block is configured.
+    const ackEmoji = agent?.chat?.discord?.output
+      ? agent.chat.discord.output.acknowledge_emoji
+      : "👀";
+    if (ackEmoji) {
+      try {
+        await event.addReaction(ackEmoji);
+      } catch (reactionError) {
+        logger.warn(`Failed to add ack reaction: ${(reactionError as Error).message}`);
+      }
+    }
+    return true;
+  }
+
+  private async runMessage(qualifiedName: string, event: DiscordMessageEvent): Promise<void> {
     const logger = this.ctx.getLogger();
     const emitter = this.ctx.getEmitter();
 
@@ -806,6 +891,9 @@ export class DiscordManager implements IChatManager {
       const result = await this.ctx.trigger(qualifiedName, undefined, {
         triggerType: "discord",
         prompt,
+        // Session-backed so follow-up messages in this channel can be pushed
+        // into the running job (handleMessage). Ignored by cli/docker runtimes.
+        interactive: true,
         resume: existingSessionId ?? null,
         sessionKey: `${qualifiedName}--discord-${event.metadata.channelId}`,
         injectedMcpServers,
