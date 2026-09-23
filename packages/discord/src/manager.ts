@@ -57,6 +57,14 @@ import { transcribeAudio } from "./voice-transcriber.js";
 // Constants
 // =============================================================================
 
+/**
+ * Grace period after a message was injected into a running Discord job: how
+ * long the session stays open for the follow-up turn once the current turn
+ * ends. Shorter than the core default (60s) — in chat the follow-up turn
+ * starts right away or the message was folded into the finished turn.
+ */
+const DISCORD_INJECTION_GRACE_MS = 15_000;
+
 // =============================================================================
 // Discord Manager
 // =============================================================================
@@ -907,6 +915,9 @@ export class DiscordManager implements IChatManager {
         // Session-backed so follow-up messages in this channel can be pushed
         // into the running job (handleMessage). Ignored by cli/docker runtimes.
         interactive: true,
+        // A chat reply that folds into the running turn should not hold the
+        // session (and its concurrency slot) open for the core default of 60s.
+        injectionGraceMs: DISCORD_INJECTION_GRACE_MS,
         resume: existingSessionId ?? null,
         sessionKey: `${qualifiedName}--discord-${event.metadata.channelId}`,
         injectedMcpServers,
@@ -1643,19 +1654,19 @@ export class DiscordManager implements IChatManager {
     });
 
     this.lastPromptByChannel.set(key, prompt);
-    void this.handleMessage(qualifiedName, syntheticEvent)
-      .catch(async (error: unknown) => {
-        const err = error instanceof Error ? error : new Error(String(error));
-        logger.error(`Background slash run failed for '${qualifiedName}': ${err.message}`);
-        try {
-          await textChannel.send(this.formatErrorMessage(err, qualifiedName));
-        } catch (replyError) {
-          logger.error(`Failed to send slash failure message: ${(replyError as Error).message}`);
-        }
-      })
-      .finally(() => {
-        this.activeJobsByChannel.delete(key);
-      });
+    void this.handleMessage(qualifiedName, syntheticEvent).catch(async (error: unknown) => {
+      const err = error instanceof Error ? error : new Error(String(error));
+      logger.error(`Background slash run failed for '${qualifiedName}': ${err.message}`);
+      try {
+        await textChannel.send(this.formatErrorMessage(err, qualifiedName));
+      } catch (replyError) {
+        logger.error(`Failed to send slash failure message: ${(replyError as Error).message}`);
+      }
+    });
+    // No cleanup of activeJobsByChannel here: handleMessage's own finally
+    // clears the entry for the job it started. Deleting by channel key here
+    // could drop the entry of a different job that is running in the channel
+    // by then (e.g. the retry prompt was injected into it).
 
     return {
       success: true,

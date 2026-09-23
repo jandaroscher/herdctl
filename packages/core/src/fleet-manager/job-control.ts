@@ -334,6 +334,7 @@ export class JobControl {
         sessionKey: options?.sessionKey,
         interactive: options?.interactive,
         sessionTimeoutMs: options?.sessionTimeoutMs,
+        injectionGraceMs: options?.injectionGraceMs,
         // Only fires when the run really is session-backed; register the handle
         // so sendToJob/interruptJob can reach this job while it runs.
         onSessionOpen: (handle) => {

@@ -293,6 +293,50 @@ describe("DiscordManager", () => {
       expect(event.metadata.channelId).toBe("channel-1");
     });
 
+    it("does not clear another job's channel entry when the retry run settles", async () => {
+      const ctx = createMockContext(null);
+      const manager = new DiscordManager(ctx);
+      const managerAny = manager as unknown as {
+        lastPromptByChannel: Map<string, string>;
+        activeJobsByChannel: Map<string, string>;
+        connectors: Map<string, unknown>;
+        retryChannelRun: (
+          qualifiedName: string,
+          channelId: string,
+        ) => Promise<{ success: boolean }>;
+        handleMessage: (qualifiedName: string, event: DiscordMessageEvent) => Promise<void>;
+      };
+      const mockChannel = {
+        isTextBased: () => true,
+        isDMBased: () => false,
+        guildId: "guild-1",
+        send: vi.fn().mockResolvedValue({ edit: vi.fn(), delete: vi.fn() }),
+      };
+      managerAny.connectors = new Map([
+        [
+          "agent-1",
+          {
+            client: {
+              isReady: () => true,
+              channels: { fetch: vi.fn().mockResolvedValue(mockChannel) },
+            },
+          },
+        ],
+      ]);
+      managerAny.lastPromptByChannel.set("agent-1:channel-1", "retry prompt");
+      // A regular message starts its own job while the retry is in flight;
+      // the retry itself ends up injected and starts nothing.
+      vi.spyOn(managerAny, "handleMessage").mockImplementation(async () => {
+        managerAny.activeJobsByChannel.set("agent-1:channel-1", "job-other");
+      });
+
+      const result = await managerAny.retryChannelRun("agent-1", "channel-1");
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(result.success).toBe(true);
+      expect(managerAny.activeJobsByChannel.get("agent-1:channel-1")).toBe("job-other");
+    });
+
     it("catches background retry failures and posts an error message", async () => {
       const ctx = createMockContext(null);
       const manager = new DiscordManager(ctx);
@@ -1304,6 +1348,7 @@ describe("DiscordManager handleMessage pipeline", () => {
     type TriggerOpts = {
       prompt: string;
       interactive?: boolean;
+      injectionGraceMs?: number;
       onJobCreated?: (id: string) => void;
     };
 
@@ -1355,6 +1400,7 @@ describe("DiscordManager handleMessage pipeline", () => {
 
       expect(t.calls).toHaveLength(1);
       expect(t.calls[0].interactive).toBe(true);
+      expect(t.calls[0].injectionGraceMs).toBe(15_000);
       expect(sendToJob).toHaveBeenCalledTimes(2);
       expect(sendToJob).toHaveBeenNthCalledWith(
         1,
